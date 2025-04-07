@@ -2,9 +2,10 @@ import random
 
 # Define a basic Wordle environment
 class WordleEnv:
-    def __init__(self, word_list, max_attempts=6):
+    def __init__(self, word_list, max_attempts=6, deception_prob=0.05):
         self.word_list = word_list
         self.max_attempts = max_attempts
+        self.deception_prob = deception_prob  # probability of corrupting non-green feedback per letter
         self.reset()
 
     def reset(self):
@@ -44,8 +45,15 @@ class WordleEnv:
             if feedback[i] != 'green' and guess[i] in solution_chars:
                 feedback[i] = 'yellow'
                 solution_chars[solution_chars.index(guess[i])] = None
-        
+
+        # Introduce unreliability for non-green feedback only:
+        for i in range(len(feedback)):
+            if feedback[i] != 'green' and random.random() < self.deception_prob:
+                # Flip "yellow" to "gray" and vice versa.
+                feedback[i] = 'gray' if feedback[i] == 'yellow' else 'yellow'
+                
         return feedback
+
 
     def render(self):
         print("\nGame History:")
