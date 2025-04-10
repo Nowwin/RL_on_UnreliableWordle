@@ -2,7 +2,7 @@ import random
 
 # Define a basic Wordle environment
 class WordleEnv:
-    def __init__(self, word_list, max_attempts=6, deception_prob=0.05):
+    def __init__(self, word_list, max_attempts=12, deception_prob=0.0):
         self.word_list = word_list
         self.max_attempts = max_attempts
         self.deception_prob = deception_prob  # probability of corrupting non-green feedback per letter
@@ -13,6 +13,10 @@ class WordleEnv:
         self.attempts = 0
         self.history = []  # Stores tuples of (guess, feedback)
         return self.history
+
+    # New helper: change deception probability on the fly.
+    def set_deception_prob(self, deception_prob):
+        self.deception_prob = deception_prob
 
     def step(self, guess):
         self.attempts += 1
@@ -53,7 +57,6 @@ class WordleEnv:
                 feedback[i] = 'gray' if feedback[i] == 'yellow' else 'yellow'
                 
         return feedback
-
 
     def render(self):
         print("\nGame History:")
