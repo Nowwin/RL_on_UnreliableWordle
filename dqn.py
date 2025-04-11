@@ -4,15 +4,61 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import random
-from collections import deque, namedtuple, Counter
+from collections import deque, defaultdict, namedtuple, Counter
 from typing import List, Tuple, Dict
 import matplotlib.pyplot as plt
 import os
 from tqdm import tqdm
 from game import WordleEnv
+import pickle
+
 
 # Define Experience tuple for storing game steps
 Experience = namedtuple('Experience', ('state', 'action', 'reward', 'next_state', 'done'))
+
+def extract_feedback_constraints(history, yellow_threshold=2):
+    green_constraints = ['_'] * 5  # known greens
+    yellow_counts = defaultdict(int)  # count how many times each yellow letter was seen
+    yellow_positions = defaultdict(set)  # letter -> set of invalid positions
+
+    for guess, feedback in history:
+        for i, (char, fb) in enumerate(zip(guess, feedback)):
+            if fb == 'green':
+                green_constraints[i] = char
+            elif fb == 'yellow':
+                yellow_counts[char] += 1
+                yellow_positions[char].add(i)
+
+    # Filter to only retain likely yellow letters
+    likely_yellows = {
+        char: pos_set
+        for char, pos_set in yellow_positions.items()
+        if yellow_counts[char] >= yellow_threshold
+    }
+
+    return green_constraints, likely_yellows
+
+def filter_candidates(word_list, green_constraints, yellow_constraints):
+    filtered = []
+    for word in word_list:
+        # Match greens
+        if any(gc != '_' and word[i] != gc for i, gc in enumerate(green_constraints)):
+            continue
+
+        # Probabilistic yellow filtering
+        valid = True
+        for letter, bad_positions in yellow_constraints.items():
+            if letter not in word:
+                valid = False
+                break
+            if any(word[pos] == letter for pos in bad_positions):
+                valid = False
+                break
+        if valid:
+            filtered.append(word)
+    
+    return filtered
+
 
 class PrioritizedReplayBuffer:
     """Prioritized Experience replay buffer for better sample efficiency"""
@@ -170,7 +216,7 @@ def encode_history(history, word_list, letter_freq=None):
         state.extend(pos)
     
     # Add number of attempts and remaining attempts
-    max_attempts = 6  # Assuming 6 attempts max
+    max_attempts = 12
     state.append(len(history))
     state.append(max_attempts - len(history))
     
@@ -234,50 +280,59 @@ class WordleAgent:
             Selected action index and corresponding word
         """
         if random.random() < epsilon:
-            # Smart exploration: try to pick words that haven't been tried
-            # and that use letters we haven't seen yet
-            if history and len(history) > 0:
-                # Get previously tried words
-                tried_words = [guess for guess, _ in history]
-                
-                # Get used letters
-                used_letters = set()
-                for word in tried_words:
-                    used_letters.update(set(word))
-                
-                # Calculate scores for each word based on new letters
-                word_scores = []
-                for word in self.word_list:
-                    if word in tried_words:
-                        # Don't repeat words
-                        continue
-                    
-                    # Count new letters in this word
-                    new_letters = set(word) - used_letters
-                    score = len(new_letters)
-                    
-                    # Add some randomness to avoid getting stuck
-                    score += random.random()
-                    
-                    word_scores.append((word, score))
-                
-                if word_scores:
-                    # Pick words with highest scores (most new letters)
+            if history:
+                tried_words = set(guess for guess, _ in history)
+                green_constraints, yellow_constraints = extract_feedback_constraints(history)
+                candidate_words = [w for w in filter_candidates(self.word_list, green_constraints, yellow_constraints)
+                       if w not in tried_words]
+                # Fallback if filtering eliminates everything
+                if not candidate_words:
+                    candidate_words = [w for w in self.word_list if w not in tried_words]
+
+                if candidate_words:
+                    word_scores = []
+                    used_letters = set(char for guess, _ in history for char in guess)
+
+                    for word in candidate_words:
+                        new_letters = set(word) - used_letters
+                        score = len(new_letters) + random.random()  # tie-breaker randomness
+                        word_scores.append((word, score))
+
                     word_scores.sort(key=lambda x: x[1], reverse=True)
-                    top_words = word_scores[:max(1, int(len(word_scores) * 0.1))]  # Top 10%
+                    top_words = word_scores[:max(1, len(word_scores) // 10)]
                     chosen_word = random.choice(top_words)[0]
                     return self.word_to_idx[chosen_word], chosen_word
             
             # Fallback to random selection
             action_idx = random.randrange(len(self.word_list))
+            return action_idx, self.idx_to_word[action_idx]
         else:
             # Use the Q-network for exploitation
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             with torch.no_grad():
-                q_values = self.q_network(state_tensor)
-            action_idx = q_values.argmax().item()
+                q_values = self.q_network(state_tensor).squeeze(0).cpu().numpy()
+            
+            if history:
+                tried_words = set(guess for guess, _ in history)
+                green_constraints, yellow_constraints = extract_feedback_constraints(history)
+                candidate_words = [w for w in filter_candidates(self.word_list, green_constraints, yellow_constraints)
+                                if w not in tried_words]
+                
+                if not candidate_words:
+                    candidate_words = [w for w in self.word_list if w not in tried_words]
+
+                if candidate_words:
+                    # Mask all words not in candidate set
+                    masked_q_values = np.full(len(self.word_list), -np.inf)
+                    for word in candidate_words:
+                        idx = self.word_to_idx[word]
+                        masked_q_values[idx] = q_values[idx]
+                    action_idx = int(np.argmax(masked_q_values))
+                    return action_idx, self.idx_to_word[action_idx]
         
-        return action_idx, self.idx_to_word[action_idx]
+            action_idx = int(np.argmax(q_values))
+
+            return action_idx, self.idx_to_word[action_idx]
     
     def update(self, batch_size, gamma=0.99, beta=0.4):
         """Update the Q-network using a batch of prioritized experiences"""
@@ -288,11 +343,18 @@ class WordleAgent:
         experiences, indices = self.replay_buffer.sample(batch_size)
         
         # Unpack experiences
-        states = torch.FloatTensor([exp.state for exp in experiences]).to(self.device)
-        actions = torch.LongTensor([exp.action for exp in experiences]).to(self.device)
-        rewards = torch.FloatTensor([exp.reward for exp in experiences]).to(self.device)
-        next_states = torch.FloatTensor([exp.next_state for exp in experiences]).to(self.device)
-        dones = torch.FloatTensor([exp.done for exp in experiences]).to(self.device)
+        # states = torch.FloatTensor([exp.state for exp in experiences]).to(self.device)
+        # actions = torch.LongTensor([exp.action for exp in experiences]).to(self.device)
+        # rewards = torch.FloatTensor([exp.reward for exp in experiences]).to(self.device)
+        # next_states = torch.FloatTensor([exp.next_state for exp in experiences]).to(self.device)
+        # dones = torch.FloatTensor([exp.done for exp in experiences]).to(self.device)
+
+        states = torch.FloatTensor(np.array([exp.state for exp in experiences])).to(self.device)
+        actions = torch.LongTensor(np.array([exp.action for exp in experiences])).to(self.device)
+        rewards = torch.FloatTensor(np.array([exp.reward for exp in experiences])).to(self.device)
+        next_states = torch.FloatTensor(np.array([exp.next_state for exp in experiences])).to(self.device)
+        dones = torch.FloatTensor(np.array([exp.done for exp in experiences])).to(self.device)
+
         
         # Compute current Q values
         current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
@@ -416,9 +478,16 @@ def train_dqn_agent(agent, env, num_episodes, batch_size=128, gamma=0.99,
         
         # Record episode statistics
         rewards.append(total_reward)
-        win_count += (total_reward > 0)
-        current_win_rate = win_count / (episode + 1)
-        win_rates.append(current_win_rate)
+        warmup_episodes = 500
+
+        if episode >= warmup_episodes:
+            if history and all(color == 'green' for color in history[-1][1]):
+                win_count += 1
+            current_win_rate = win_count / (episode - warmup_episodes + 1)
+            win_rates.append(current_win_rate)
+        else:
+            current_win_rate = 0.0  # or np.nan if you prefer to skip plotting
+            win_rates.append(current_win_rate)
         
         # Update learning rate based on performance
         if episode % 100 == 0:
@@ -434,21 +503,25 @@ def train_dqn_agent(agent, env, num_episodes, batch_size=128, gamma=0.99,
             episodes_without_improvement += 1
         
         # Print verbose output periodically
-        if verbose and episode % 100 == 0:
-            print(f"Episode {episode}: Reward = {total_reward}, Win Rate = {current_win_rate:.4f}, Epsilon = {epsilon:.4f}")
+        if verbose and episode % 500 == 0:
+            print(f"Episode {episode}: Epsilon = {epsilon:.4f}")
             
             # Print examples of recent wins/losses for debugging
             recent_rewards = rewards[-100:] if len(rewards) >= 100 else rewards
             recent_win_rate = sum(1 for r in recent_rewards if r > 0) / len(recent_rewards)
+            avg_recent_reward = sum(recent_rewards) / len(recent_rewards)
+    
+            print(f"Recent 100 episodes average reward: {avg_recent_reward:.4f}")
             print(f"Recent 100 episodes win rate: {recent_win_rate:.4f}")
+
         
         # Early stopping if win rate threshold reached or no improvement for too long
-        if current_win_rate >= reward_threshold or episodes_without_improvement >= early_stopping_threshold:
-            if current_win_rate >= reward_threshold:
-                print(f"Early stopping: win rate threshold {reward_threshold} reached!")
-            else:
-                print(f"Early stopping: no improvement for {early_stopping_threshold} episodes.")
-            break
+        # if current_win_rate >= reward_threshold or episodes_without_improvement >= early_stopping_threshold:
+        #     if current_win_rate >= reward_threshold:
+        #         print(f"Early stopping: win rate threshold {reward_threshold} reached!")
+        #     else:
+        #         print(f"Early stopping: no improvement for {early_stopping_threshold} episodes.")
+        #     break
     
     # Save the final trained model
     if save_path:
@@ -482,10 +555,20 @@ def evaluate_agent(agent, env, num_episodes, render_every=0):
         if render_every > 0 and episode % render_every == 0:
             print(f"\nEvaluation game {episode}, target word: {env.solution}")
         
+        guessed_words = set()
+
         # Play one episode
         while not done:
             # Select the best action (no exploration)
-            action_idx, action_word = agent.get_action(state, epsilon=0)
+            action_idx, action_word = agent.get_action(state, epsilon=0, history=history)
+
+            if action_word in guessed_words:
+                untried = [w for w in agent.word_list if w not in guessed_words]
+                if untried:
+                    action_word = random.choice(untried)
+                    action_idx = agent.word_to_idx[action_word]
+
+            guessed_words.add(action_word)
             
             if render_every > 0 and episode % render_every == 0:
                 print(f"Attempt {episode_attempts+1}: Agent guesses '{action_word}'")
@@ -504,7 +587,8 @@ def evaluate_agent(agent, env, num_episodes, render_every=0):
             episode_attempts += 1
             
             if done:
-                if reward > 0:
+                last_feedback = next_history[-1][1]
+                if action_word == env.solution:
                     win_count += 1
                     if render_every > 0 and episode % render_every == 0:
                         print(f"Agent WON in {episode_attempts} attempts!")
@@ -545,18 +629,22 @@ def run_dqn_experiment(word_list, num_episodes=5000, eval_episodes=1000,
         print(f"\n=== Running experiment with deception probability {deception_prob} ===")
         
         # Create the environment and agent
-        env = WordleEnv(word_list, max_attempts=6, deception_prob=deception_prob)
+        env = WordleEnv(word_list, max_attempts=12, deception_prob=deception_prob)
         agent = WordleAgent(state_dim, action_dim, word_list, hidden_dim=hidden_dim, lr=0.0005)
         
         # Train the agent with improved parameters
         save_path = f"wordle_dqn_deception_{deception_prob}.pt"
         train_stats = train_dqn_agent(
             agent, env, num_episodes=num_episodes, 
-            batch_size=batch_size, gamma=0.99, 
+            batch_size=batch_size, gamma=0.9, 
             epsilon_start=1.0, epsilon_end=0.01, epsilon_decay=0.9995,
             target_update=10, save_path=save_path, verbose=True,
             reward_threshold=reward_threshold
         )
+
+        stats_filename = f"train_stats_deception_{deception_prob}.pkl"
+        with open(stats_filename, "wb") as f:
+            pickle.dump(train_stats, f)
         
         # Evaluate the trained agent
         eval_stats = evaluate_agent(agent, env, num_episodes=eval_episodes, render_every=100)
@@ -630,9 +718,13 @@ def plot_detailed_results(results, deception_levels):
         
         # Apply smoothing
         window_size = 50
-        smoothed = np.convolve(rewards[:episodes], np.ones(window_size)/window_size, mode='valid')
-        plt.plot(smoothed, label=f"Deception={d}")
-    
+
+        if episodes >= window_size:
+            smoothed = np.convolve(rewards[:episodes], np.ones(window_size)/window_size, mode='valid')
+            plt.plot(smoothed, label=f"Deception={d}")
+        else:
+            plt.plot(rewards[:episodes], label=f"Deception={d} (no smoothing)")
+
     plt.xlabel("Episode")
     plt.ylabel("Smoothed Episode Reward")
     plt.title("Training Reward Progression")
@@ -681,16 +773,17 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     
     # Run the experiments with improved parameters
-    deception_levels = [0.0, 0.05, 0.1]
+    deception_levels = [0.1]
     results = run_dqn_experiment(
         word_list, 
-        num_episodes=10000,  # More episodes for better learning
+        num_episodes=100000,  # More episodes for better learning
         eval_episodes=1000,
         deception_levels=deception_levels,
-        batch_size=128,
-        hidden_dim=256,
-        reward_threshold=0.4  # Stop early if win rate reaches 40%
+        batch_size=64,
+        hidden_dim=128,
+        reward_threshold=0.9
     )
     
     # Plot detailed results
     plot_detailed_results(results, deception_levels)
+
