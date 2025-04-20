@@ -50,7 +50,6 @@ def simulation_agent(word_list, env, verbose=False):
 
     while not done:
         attempt += 1
-        # Choose a guess from the candidate set (here, a random candidate).
         guess = random.choice(candidates)
         if verbose:
             print(f"Attempt {attempt}: Guessing '{guess}'")
@@ -61,7 +60,8 @@ def simulation_agent(word_list, env, verbose=False):
             env.render()
         
         if done:
-            win = (reward > 0)
+            # Change here: check actual match, not reward>0
+            win = (guess == env.solution)
             if verbose:
                 if win:
                     print("Agent successfully guessed the word!")
@@ -69,13 +69,11 @@ def simulation_agent(word_list, env, verbose=False):
                     print(f"Agent failed. The word was: '{env.solution}'")
             return attempt, total_reward, win
 
-        # Update the candidate list based on the feedback of the last guess.
         last_feedback = history[-1][1]
         new_candidates = [w for w in candidates if is_consistent(w, guess, last_feedback)]
         if new_candidates:
             candidates = new_candidates
         else:
-            # If filtering leaves no candidates, reset to the full list.
             if verbose:
                 print("No candidates left after filtering. Resetting candidate set.")
             candidates = word_list.copy()
@@ -102,8 +100,8 @@ def run_episodes(word_list, num_episodes, deception_prob):
 if __name__ == "__main__":
     # Load word list from file (ensure "wordList.txt" is in the same directory)
     word_list = load_word_list("wordList2.txt")
-    num_episodes = 10000
-    deception_levels = [0.0, 0.05, 0.1]
+    num_episodes = 1000
+    deception_levels = [0.0, 0.1, 0.2]
 
     # Dictionaries to hold results for each deception probability.
     win_rates = {}

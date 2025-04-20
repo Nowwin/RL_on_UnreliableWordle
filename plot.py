@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # Load your training stats
-with open("train_stats_deception_0.1.pkl", "rb") as f:
+with open("wordle_dqn_deception.pt_ep390000_stats.pkl", "rb") as f:
     stats = pickle.load(f)
 
 # Extract data

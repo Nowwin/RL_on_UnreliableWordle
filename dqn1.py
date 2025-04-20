@@ -11,28 +11,56 @@ import os
 from tqdm import tqdm
 from game import WordleEnv
 import pickle
+from dqn_alphabet import WordleAlphabetDQN, top_k_words_from_distribution  # or define it earlier in your file
+
+# Inside WordleAgent.__init__()
 
 
 # Define Experience tuple for storing game steps
 Experience = namedtuple('Experience', ('state', 'action', 'reward', 'next_state', 'done'))
 
-def extract_feedback_constraints(history):
-    green_constraints = ['_'] * 5
+def extract_feedback_constraints(history, yellow_threshold=2):
+    green_constraints = ['_'] * 5  # known greens
+    yellow_counts = defaultdict(int)  # count how many times each yellow letter was seen
+    yellow_positions = defaultdict(set)  # letter -> set of invalid positions
+
     for guess, feedback in history:
         for i, (char, fb) in enumerate(zip(guess, feedback)):
             if fb == 'green':
                 green_constraints[i] = char
-    return green_constraints
+            elif fb == 'yellow':
+                yellow_counts[char] += 1
+                yellow_positions[char].add(i)
 
+    # Filter to only retain likely yellow letters
+    likely_yellows = {
+        char: pos_set
+        for char, pos_set in yellow_positions.items()
+        if yellow_counts[char] >= yellow_threshold
+    }
 
-def filter_candidates(word_list, green_constraints):
+    return green_constraints, likely_yellows
+
+def filter_candidates(word_list, green_constraints, yellow_constraints):
     filtered = []
     for word in word_list:
+        # Match greens
         if any(gc != '_' and word[i] != gc for i, gc in enumerate(green_constraints)):
             continue
-        filtered.append(word)
-    return filtered
 
+        # Probabilistic yellow filtering
+        valid = True
+        for letter, bad_positions in yellow_constraints.items():
+            if letter not in word:
+                valid = False
+                break
+            if any(word[pos] == letter for pos in bad_positions):
+                valid = False
+                break
+        if valid:
+            filtered.append(word)
+    
+    return filtered
 
 
 class PrioritizedReplayBuffer:
@@ -147,9 +175,6 @@ def encode_history(history, word_list, letter_freq=None):
     green_letters = [[0] * 26 for _ in range(5)]  # Position-specific green letters
     yellow_letters = [[0] * 26 for _ in range(5)]  # Position-specific yellow letters
     gray_letters = [0] * 26  # Letters that aren't in the word
-    yellow_seen = [[0] * 26 for _ in range(5)]  # Tracks if yellow was seen before
-    flip_counts = [[0] * 26 for _ in range(5)]  # Counts yellow->gray flips
-
     
     # Process history
     for guess, feedback in history:
@@ -162,11 +187,8 @@ def encode_history(history, word_list, letter_freq=None):
             elif fb == 'yellow':
                 position_feedback[i][1] += 1
                 yellow_letters[i][letter_idx] = 1
-                yellow_seen[i][letter_idx] = 1
             else:  # gray
                 position_feedback[i][2] += 1
-                if yellow_seen[i][letter_idx]:
-                    flip_counts[i][letter_idx] += 1
                 
                 # Only mark as gray if not green or yellow elsewhere
                 is_used = False
@@ -211,17 +233,19 @@ def encode_history(history, word_list, letter_freq=None):
     # Add gray letters and letter weights
     state.extend(gray_letters)
     state.extend(letter_weights)
-
-    for pos in flip_counts:
-        state.extend(pos)
     
     return np.array(state, dtype=np.float32)
 
 class WordleAgent:
     """Improved agent that plays Wordle using a DQN with better exploration strategies"""
-    def __init__(self, state_dim, action_dim, word_list, hidden_dim=256, lr=0.001):
+    def __init__(self, state_dim, word_list, hidden_dim=256, lr=0.0005):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.word_list = word_list
+
+        self.word_letter_indices = np.array([
+            [ord(c) - ord('a') for c in word]
+            for word in self.word_list
+        ])
         
         # Calculate letter frequencies for the word list (used in state encoding)
         all_letters = ''.join(word_list)
@@ -231,8 +255,10 @@ class WordleAgent:
             self.letter_freq[letter] = all_letters.count(letter) / total_letters
         
         # Initialize Q networks
-        self.q_network = WordleDQN(state_dim, action_dim, hidden_dim).to(self.device)
-        self.target_network = WordleDQN(state_dim, action_dim, hidden_dim).to(self.device)
+        # self.q_network = WordleDQN(state_dim, action_dim, hidden_dim).to(self.device)
+        # self.target_network = WordleDQN(state_dim, action_dim, hidden_dim).to(self.device)
+        self.q_network = WordleAlphabetDQN(state_dim, hidden_dim).to(self.device)
+        self.target_network = WordleAlphabetDQN(state_dim, hidden_dim).to(self.device)
         self.target_network.load_state_dict(self.q_network.state_dict())
         
         # Use Adam optimizer with smaller learning rate for stability
@@ -266,9 +292,9 @@ class WordleAgent:
     #     if random.random() < epsilon:
     #         if history:
     #             tried_words = set(guess for guess, _ in history)
-    #             green_constraints = extract_feedback_constraints(history)
-    #             candidate_words = [w for w in filter_candidates(self.word_list, green_constraints)
-    #                             if w not in tried_words]
+    #             green_constraints, yellow_constraints = extract_feedback_constraints(history)
+    #             candidate_words = [w for w in filter_candidates(self.word_list, green_constraints, yellow_constraints)
+    #                    if w not in tried_words]
     #             # Fallback if filtering eliminates everything
     #             if not candidate_words:
     #                 candidate_words = [w for w in self.word_list if w not in tried_words]
@@ -298,10 +324,9 @@ class WordleAgent:
             
     #         if history:
     #             tried_words = set(guess for guess, _ in history)
-    #             green_constraints = extract_feedback_constraints(history)
-    #             candidate_words = [w for w in filter_candidates(self.word_list, green_constraints)
+    #             green_constraints, yellow_constraints = extract_feedback_constraints(history)
+    #             candidate_words = [w for w in filter_candidates(self.word_list, green_constraints, yellow_constraints)
     #                             if w not in tried_words]
-
                 
     #             if not candidate_words:
     #                 candidate_words = [w for w in self.word_list if w not in tried_words]
@@ -318,58 +343,40 @@ class WordleAgent:
     #         action_idx = int(np.argmax(q_values))
 
     #         return action_idx, self.idx_to_word[action_idx]
-
+    
     def get_action(self, state, epsilon, history=None):
         """
-        Action selection with epsilon-greedy strategy and no repeated guesses.
+        Action selection using alphabet-level softmax output and top-k filtering,
+        with exploration + avoiding repeated guesses.
         """
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            output = self.q_network(state_tensor).squeeze(0).cpu().numpy()  # shape (5, 26)
+            top_words = top_k_words_from_distribution(
+                output, self.word_list, self.word_letter_indices, k=5
+            )
+
         tried_words = set(guess for guess, _ in history) if history else set()
 
-        if random.random() < epsilon:
-            # Random exploration among untried words
-            candidates = [w for w in self.word_list if w not in tried_words]
-            if not candidates:
-                candidates = self.word_list  # fallback
-            chosen_word = random.choice(candidates)
-            return self.word_to_idx[chosen_word], chosen_word
+        # Remove previously guessed words from top_words
+        top_words = [w for w in top_words if w[0] not in tried_words]
+
+        # Fallback if all top-k are exhausted
+        if not top_words:
+            untried = [w for w in self.word_list if w not in tried_words]
+            if not untried:
+                # Last resort: everything has been guessed
+                chosen_word = random.choice(self.word_list)
+            else:
+                chosen_word = random.choice(untried)
         else:
-            # Greedy selection from Q-values
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                q_values = self.q_network(state_tensor).squeeze(0).cpu().numpy()
+            if random.random() < epsilon:
+                chosen_word = random.choice(top_words)[0]
+            else:
+                chosen_word = top_words[0][0]
 
-            masked_q_values = np.copy(q_values)
-            for word in tried_words:
-                idx = self.word_to_idx[word]
-                masked_q_values[idx] = -np.inf
-
-            action_idx = int(np.argmax(masked_q_values))
-            return action_idx, self.idx_to_word[action_idx]
-
-    
-    # def get_action(self, state, epsilon, history=None):
-    #     """
-    #     Simplified action selection based solely on Q-values from the network,
-    #     with epsilon-greedy exploration (no constraint filtering).
-        
-    #     Args:
-    #         state: Current state vector
-    #         epsilon: Exploration rate
-        
-    #     Returns:
-    #         Tuple (action_index, word)
-    #     """
-    #     if random.random() < epsilon:
-    #         # Random exploration
-    #         action_idx = random.randrange(len(self.word_list))
-    #         return action_idx, self.idx_to_word[action_idx]
-    #     else:
-    #         # Exploitation using Q-network
-    #         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-    #         with torch.no_grad():
-    #             q_values = self.q_network(state_tensor).squeeze(0).cpu().numpy()
-    #         action_idx = int(np.argmax(q_values))
-    #         return action_idx, self.idx_to_word[action_idx]
+        return self.word_to_idx[chosen_word], chosen_word
 
 
     def update(self, batch_size, gamma=0.99, beta=0.4):
@@ -393,41 +400,67 @@ class WordleAgent:
         next_states = torch.FloatTensor(np.array([exp.next_state for exp in experiences])).to(self.device)
         dones = torch.FloatTensor(np.array([exp.done for exp in experiences])).to(self.device)
 
-        
-        # Compute current Q values
-        current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-        
-        # Compute next Q values with Double Q-learning
-        with torch.no_grad():
-            # Get actions from current network
-            next_actions = self.q_network(next_states).argmax(1).unsqueeze(1)
-            # Get Q-values from target network
-            next_q_values = self.target_network(next_states).gather(1, next_actions).squeeze(1)
-            # Zero out Q-values for terminal states
-            next_q_values = next_q_values * (1 - dones)
-        
-        # Compute target Q values
-        target_q_values = rewards + gamma * next_q_values
-        
-        # Compute loss
-        loss = self.loss_fn(current_q_values, target_q_values)
-        
-        # Compute TD errors for prioritization
-        with torch.no_grad():
-            td_errors = torch.abs(target_q_values - current_q_values).cpu().numpy()
-        
-        # Update priorities in the replay buffer
-        new_priorities = td_errors + 1e-6  # Add small constant to avoid zero priority
-        self.replay_buffer.update_priorities(indices, new_priorities)
-        
-        # Update the Q-network
+        outputs = self.q_network(states) 
+        batch_target_words = [self.idx_to_word[a.item()] for a in actions]
+        target_letters = [
+            [ord(c) - ord('a') for c in word]
+            for word in batch_target_words
+        ]
+
+        targets = torch.tensor(target_letters, device=self.device)
+
+        # --- Step 4: Compute loss: sum of cross-entropies across positions ---
+        loss = 0
+        for i in range(5):
+            loss += F.cross_entropy(outputs[:, i, :], targets[:, i])
+        loss /= 5.0  # Average over positions
+
+        # --- Step 5: Backpropagation ---
         self.optimizer.zero_grad()
         loss.backward()
-        # Gradient clipping to prevent exploding gradients
         torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 1.0)
         self.optimizer.step()
-        
+
+        # You can skip priority updates or use the total loss as TD error:
+        td_errors = loss.detach().cpu().numpy()
+        self.replay_buffer.update_priorities(indices, [td_errors + 1e-6] * len(indices))
+
         return loss.item()
+        
+        # # Compute current Q values
+        # current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        
+        # # Compute next Q values with Double Q-learning
+        # with torch.no_grad():
+        #     # Get actions from current network
+        #     next_actions = self.q_network(next_states).argmax(1).unsqueeze(1)
+        #     # Get Q-values from target network
+        #     next_q_values = self.target_network(next_states).gather(1, next_actions).squeeze(1)
+        #     # Zero out Q-values for terminal states
+        #     next_q_values = next_q_values * (1 - dones)
+        
+        # # Compute target Q values
+        # target_q_values = rewards + gamma * next_q_values
+        
+        # # Compute loss
+        # loss = self.loss_fn(current_q_values, target_q_values)
+        
+        # # Compute TD errors for prioritization
+        # with torch.no_grad():
+        #     td_errors = torch.abs(target_q_values - current_q_values).cpu().numpy()
+        
+        # # Update priorities in the replay buffer
+        # new_priorities = td_errors + 1e-6  # Add small constant to avoid zero priority
+        # self.replay_buffer.update_priorities(indices, new_priorities)
+        
+        # # Update the Q-network
+        # self.optimizer.zero_grad()
+        # loss.backward()
+        # # Gradient clipping to prevent exploding gradients
+        # torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 1.0)
+        # self.optimizer.step()
+        
+        # return loss.item()
     
     def update_target_network(self, tau=1.0):
         """Update the target network using soft update or hard update"""
@@ -472,28 +505,6 @@ def train_dqn_agent(agent, env, num_episodes, batch_size=128, gamma=0.99,
     episodes_without_improvement = 0
     best_win_rate = 0
     tau = 0.01  # Soft update parameter
-
-    initial_exploration_steps = 1000
-    print(f"Collecting {initial_exploration_steps} warm-up steps...")
-
-    while len(agent.replay_buffer) < initial_exploration_steps:
-        history = env.reset()
-        state = encode_history(history, agent.word_list, agent.letter_freq)
-        done = False
-
-        while not done:
-            action_idx = random.randrange(len(agent.word_list))
-            action_word = agent.idx_to_word[action_idx]
-
-            next_history, reward, done, _ = env.step(action_word)
-            next_state = encode_history(next_history, agent.word_list, agent.letter_freq)
-
-            agent.replay_buffer.push(Experience(state, action_idx, reward, next_state, done))
-
-            state = next_state
-            history = next_history
-
-    print("Warm-up complete.\n")
     
     # Training loop
     for episode in tqdm(range(num_episodes), desc="Training"):
@@ -527,7 +538,7 @@ def train_dqn_agent(agent, env, num_episodes, batch_size=128, gamma=0.99,
             total_reward += reward
         
         # Soft update the target network every step
-        # agent.update_target_network(tau)
+        agent.update_target_network(tau)
         
         # Hard update the target network periodically
         if episode % target_update == 0:
@@ -538,35 +549,20 @@ def train_dqn_agent(agent, env, num_episodes, batch_size=128, gamma=0.99,
         
         # Record episode statistics
         rewards.append(total_reward)
-        if history and all(color == 'green' for color in history[-1][1]):
-            win_count += 1
+        warmup_episodes = 500
 
-
-        current_win_rate = win_count / (episode + 1)
-        win_rates.append(current_win_rate)
+        if episode >= warmup_episodes:
+            if history and all(color == 'green' for color in history[-1][1]):
+                win_count += 1
+            current_win_rate = win_count / (episode - warmup_episodes + 1)
+            win_rates.append(current_win_rate)
+        else:
+            current_win_rate = 0.0  # or np.nan if you prefer to skip plotting
+            win_rates.append(current_win_rate)
         
         # Update learning rate based on performance
         if episode % 100 == 0:
             agent.scheduler.step(current_win_rate)
-        
-        # Periodic checkpoint every 10k episodes
-        if save_path and episode % 10000 == 0 and episode > 0:
-            checkpoint_name = f"{save_path}_ep{episode}"
-            agent.save(checkpoint_name)
-
-            stats_checkpoint = {
-                'rewards': rewards[:],
-                'win_rates': win_rates[:],
-                'losses': losses[:],
-                'current_episode': episode,
-                'epsilon': epsilon,
-                'best_win_rate': best_win_rate
-            }
-            with open(f"{checkpoint_name}_stats.pkl", "wb") as f:
-                pickle.dump(stats_checkpoint, f)
-            if verbose:
-                print(f"[Checkpoint] Saved model and stats at episode {episode}")
-
         
         # Check for early stopping
         if current_win_rate > best_win_rate:
@@ -583,9 +579,11 @@ def train_dqn_agent(agent, env, num_episodes, batch_size=128, gamma=0.99,
             
             # Print examples of recent wins/losses for debugging
             recent_rewards = rewards[-100:] if len(rewards) >= 100 else rewards
+            recent_win_rate = sum(1 for r in recent_rewards if r >= 10) / len(recent_rewards)
             avg_recent_reward = sum(recent_rewards) / len(recent_rewards)
     
             print(f"Recent 100 episodes average reward: {avg_recent_reward:.4f}")
+            print(f"Recent 100 episodes win rate: {recent_win_rate:.4f}")
 
         
         # Early stopping if win rate threshold reached or no improvement for too long
@@ -686,25 +684,6 @@ def evaluate_agent(agent, env, num_episodes, render_every=0):
         'attempt_distribution': attempt_distribution
     }
 
-class RandomDeceptionEnv:
-    def __init__(self, base_env: WordleEnv, deception_choices: List[float]):
-        self.base_env = base_env
-        self.deception_choices = deception_choices
-
-    def reset(self):
-        # Randomly pick deception for this episode
-        deception_prob = random.choice(self.deception_choices)
-        self.base_env.set_deception_prob(deception_prob)
-        return self.base_env.reset()
-    
-    def step(self, action):
-        return self.base_env.step(action)
-    
-    def __getattr__(self, name):
-        # Delegate everything else to the base env
-        return getattr(self.base_env, name)
-
-
 def run_dqn_experiment(word_list, num_episodes=5000, eval_episodes=1000, 
                       deception_levels=[0.0, 0.05, 0.1], batch_size=128,
                       hidden_dim=256, reward_threshold=0.5):
@@ -712,94 +691,50 @@ def run_dqn_experiment(word_list, num_episodes=5000, eval_episodes=1000,
     Run experiments with different deception levels using improved parameters
     """
     # Calculate enhanced state dimensions
-    state_dim = (5 * 3) + 2 + (26 * 5 * 2) + 26 + 26 + (26*5)
+    state_dim = (5 * 3) + 2 + (26 * 5 * 2) + 26 + 26
     action_dim = len(word_list)
     
     results = {}
+    
+    for deception_prob in deception_levels:
+        print(f"\n=== Running experiment with deception probability {deception_prob} ===")
+        
+        # Create the environment and agent
+        env = WordleEnv(word_list, max_attempts=12, deception_prob=deception_prob)
+        agent = WordleAgent(state_dim, word_list, hidden_dim=hidden_dim, lr=0.0005)
+        
+        # Train the agent with improved parameters
+        save_path = f"wordle_dqn_deception_{deception_prob}.pt"
+        train_stats = train_dqn_agent(
+            agent, env, num_episodes=num_episodes, 
+            batch_size=batch_size, gamma=0.9, 
+            epsilon_start=1.0, epsilon_end=0.01, epsilon_decay=0.9995,
+            target_update=10, save_path=save_path, verbose=True,
+            reward_threshold=reward_threshold
+        )
 
-    print(f"\n=== Running experiment with randomized deception levels: {deception_levels} ===")
+        stats_filename = f"train_stats_deception_{deception_prob}.pkl"
+        with open(stats_filename, "wb") as f:
+            pickle.dump(train_stats, f)
         
-    # Create the environment and agent
-    base_env = WordleEnv(word_list, max_attempts=12, deception_prob=0.0)  # init with any value
-    env = RandomDeceptionEnv(base_env, deception_levels)
-    agent = WordleAgent(state_dim, action_dim, word_list, hidden_dim=hidden_dim, lr=0.0003)
-
-    computed_decay = (0.01 / 1.0) ** (1 / (0.9 * num_episodes))
-    
-    # Train the agent with improved parameters
-    save_path = f"wordle_dqn_deception.pt"
-    train_stats = train_dqn_agent(
-        agent, env, num_episodes=num_episodes, 
-        batch_size=batch_size, gamma=0.9, 
-        epsilon_start=1.0, epsilon_end=0.01, epsilon_decay=computed_decay,
-        target_update=100, save_path=save_path, verbose=True,
-        reward_threshold=reward_threshold
-    )
-
-    stats_filename = f"train_stats_deception_{deception_prob}.pkl"
-    with open(stats_filename, "wb") as f:
-        pickle.dump(train_stats, f)
-    
-    # Evaluate the trained agent
-    eval_stats = evaluate_agent(agent, env, num_episodes=eval_episodes, render_every=100)
-    
-    results[deception_prob] = {
-        'train': train_stats,
-        'eval': eval_stats
-    }
-    
-    # Print detailed results
-    print(f"Results for deception probability {deception_prob}:")
-    print(f"  Win Rate: {eval_stats['win_rate']:.4f}")
-    print(f"  Avg Reward: {eval_stats['avg_reward']:.4f}")
-    print(f"  Avg Attempts: {eval_stats['avg_attempts']:.4f}")
-    
-    if eval_stats['attempt_distribution']:
-        print("  Attempt distribution for winning games:")
-        for attempt, count in sorted(eval_stats['attempt_distribution'].items()):
-            print(f"    {attempt} attempts: {count} games ({count/sum(eval_stats['attempt_distribution'].values())*100:.1f}%)")
-    
-    # for deception_prob in deception_levels:
-    #     print(f"\n=== Running experiment with deception probability {deception_prob} ===")
+        # Evaluate the trained agent
+        eval_stats = evaluate_agent(agent, env, num_episodes=eval_episodes, render_every=100)
         
-    #     # Create the environment and agent
-    #     env = WordleEnv(word_list, max_attempts=12, deception_prob=deception_prob)
-    #     agent = WordleAgent(state_dim, action_dim, word_list, hidden_dim=hidden_dim, lr=0.0003)
-
-    #     computed_decay = (0.01 / 1.0) ** (1 / (0.9 * num_episodes))
+        results[deception_prob] = {
+            'train': train_stats,
+            'eval': eval_stats
+        }
         
-    #     # Train the agent with improved parameters
-    #     save_path = f"wordle_dqn_deception_{deception_prob}.pt"
-    #     train_stats = train_dqn_agent(
-    #         agent, env, num_episodes=num_episodes, 
-    #         batch_size=batch_size, gamma=0.9, 
-    #         epsilon_start=1.0, epsilon_end=0.01, epsilon_decay=computed_decay,
-    #         target_update=1000, save_path=save_path, verbose=True,
-    #         reward_threshold=reward_threshold
-    #     )
-
-    #     stats_filename = f"train_stats_deception_{deception_prob}.pkl"
-    #     with open(stats_filename, "wb") as f:
-    #         pickle.dump(train_stats, f)
+        # Print detailed results
+        print(f"Results for deception probability {deception_prob}:")
+        print(f"  Win Rate: {eval_stats['win_rate']:.4f}")
+        print(f"  Avg Reward: {eval_stats['avg_reward']:.4f}")
+        print(f"  Avg Attempts: {eval_stats['avg_attempts']:.4f}")
         
-    #     # Evaluate the trained agent
-    #     eval_stats = evaluate_agent(agent, env, num_episodes=eval_episodes, render_every=100)
-        
-    #     results[deception_prob] = {
-    #         'train': train_stats,
-    #         'eval': eval_stats
-    #     }
-        
-    #     # Print detailed results
-    #     print(f"Results for deception probability {deception_prob}:")
-    #     print(f"  Win Rate: {eval_stats['win_rate']:.4f}")
-    #     print(f"  Avg Reward: {eval_stats['avg_reward']:.4f}")
-    #     print(f"  Avg Attempts: {eval_stats['avg_attempts']:.4f}")
-        
-    #     if eval_stats['attempt_distribution']:
-    #         print("  Attempt distribution for winning games:")
-    #         for attempt, count in sorted(eval_stats['attempt_distribution'].items()):
-    #             print(f"    {attempt} attempts: {count} games ({count/sum(eval_stats['attempt_distribution'].values())*100:.1f}%)")
+        if eval_stats['attempt_distribution']:
+            print("  Attempt distribution for winning games:")
+            for attempt, count in sorted(eval_stats['attempt_distribution'].items()):
+                print(f"    {attempt} attempts: {count} games ({count/sum(eval_stats['attempt_distribution'].values())*100:.1f}%)")
     
     return results
 
@@ -899,7 +834,6 @@ def load_word_list(filename):
 if __name__ == "__main__":
     # Load the word list
     word_list = load_word_list("small_wordlist.txt")
-    word_list = word_list[:100]
     
     # Print some statistics
     print(f"Loaded {len(word_list)} words")
@@ -910,13 +844,13 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     
     # Run the experiments with improved parameters
-    deception_levels = [0.2]
+    deception_levels = [0.1]
     results = run_dqn_experiment(
         word_list, 
-        num_episodes=500000,  # More episodes for better learning
+        num_episodes=100000,  # More episodes for better learning
         eval_episodes=100,
         deception_levels=deception_levels,
-        batch_size=256,
+        batch_size=128,
         hidden_dim=128,
         reward_threshold=0.9
     )

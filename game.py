@@ -1,4 +1,5 @@
 import random
+import math  # at the top of the file
 
 # Define a basic Wordle environment
 class WordleEnv:
@@ -23,15 +24,53 @@ class WordleEnv:
         feedback = self._get_feedback(guess)
         self.history.append((guess, feedback))
         done = False
-        reward = -0.1  # Small penalty per guess
-        
+
+        # Count feedback
+        num_green = sum(1 for f in feedback if f == 'green')
+        num_yellow = sum(1 for f in feedback if f == 'yellow')
+
+        # Base shaped reward
+        partial_reward = num_green * 0.5 + num_yellow * 0.2
+        step_penalty = -0.1  # Discourage long games
+        reward = partial_reward + step_penalty
+
+        # Win reward scaled by attempts
         if guess == self.solution:
-            reward = 1.0  # Reward for guessing correctly
             done = True
+            efficiency_bonus = max(0, (self.max_attempts - self.attempts)) * 0.5
+            reward = 10.0 + efficiency_bonus  # strong incentive for early win
         elif self.attempts >= self.max_attempts:
             done = True
 
         return self.history, reward, done, {}
+
+
+
+    # def step(self, guess):
+    #     self.attempts += 1
+    #     feedback = self._get_feedback(guess)
+    #     self.history.append((guess, feedback))
+    #     done = False
+
+    #     # Exponential reward per letter
+    #     reward = 0.0
+    #     for fb in feedback:
+    #         if fb == 'green':
+    #             reward += math.exp(1)       
+    #         elif fb == 'yellow':
+    #             reward += math.exp(0.5)     
+    #         else:  # gray
+    #             reward -= math.exp(1)       
+
+    #     # Bonus for solving
+    #     if guess == self.solution:
+    #         reward += 10.0  # small bonus on top
+    #         done = True
+    #     elif self.attempts >= self.max_attempts:
+    #         done = True
+
+    #     return self.history, reward, done, {}
+
 
     def _get_feedback(self, guess):
         # Initialize all feedback as "gray"
